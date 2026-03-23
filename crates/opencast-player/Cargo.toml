@@ -1,0 +1,14 @@
+[package]
+name = "opencast-player"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Unified media player engine for OpenCast"
+
+[dependencies]
+opencast-core.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+url.workspace = true

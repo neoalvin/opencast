@@ -1,0 +1,20 @@
+[package]
+name = "opencast-discovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Device discovery for OpenCast (SSDP + mDNS)"
+
+[dependencies]
+opencast-core.workspace = true
+tokio.workspace = true
+socket2.workspace = true
+mdns-sd.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+url.workspace = true
+reqwest.workspace = true
+quick-xml.workspace = true
+bytes.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "opencast-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TV-side receiver application for OpenCast"
+
+[dependencies]
+opencast-core.workspace = true
+opencast-discovery.workspace = true
+opencast-dlna.workspace = true
+opencast-player.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+uuid.workspace = true

@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/opencast-core",
+    "crates/opencast-discovery",
+    "crates/opencast-dlna",
+    "crates/opencast-player",
+    "crates/opencast-server",
+    "crates/opencast-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/opencast-project/opencast"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+reqwest = { version = "0.12", features = ["json"] }
+
+# XML (for SOAP/UPnP)
+quick-xml = { version = "0.36", features = ["serialize"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Networking
+socket2 = { version = "0.5", features = ["all"] }
+
+# mDNS
+mdns-sd = "0.11"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+url = { version = "2", features = ["serde"] }
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+
+# Internal crates
+opencast-core = { path = "crates/opencast-core" }
+opencast-discovery = { path = "crates/opencast-discovery" }
+opencast-dlna = { path = "crates/opencast-dlna" }
+opencast-player = { path = "crates/opencast-player" }
+opencast-server = { path = "crates/opencast-server" }
