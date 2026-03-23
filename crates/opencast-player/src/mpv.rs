@@ -40,6 +40,12 @@ struct MpvConnection {
     writer: Option<tokio::io::WriteHalf<UnixStream>>,
 }
 
+impl Default for MpvPlayer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MpvPlayer {
     pub fn new() -> Self {
         let ipc_path =

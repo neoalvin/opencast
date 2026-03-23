@@ -6,7 +6,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use opencast_core::{PositionInfo, TransportState, VolumeInfo};
+use opencast_core::{RendererCallback, TransportState, VolumeInfo};
 use opencast_discovery::ssdp::build_device_description;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
@@ -16,19 +16,6 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-/// Callback for handling media commands from a DLNA controller.
-pub trait RendererCallback: Send + Sync + 'static {
-    fn on_set_uri(&self, url: String, metadata: String);
-    fn on_play(&self);
-    fn on_pause(&self);
-    fn on_stop(&self);
-    fn on_seek(&self, position_secs: f64);
-    fn on_set_volume(&self, volume: u32);
-    fn on_set_mute(&self, muted: bool);
-    fn get_position_info(&self) -> PositionInfo;
-    fn get_transport_state(&self) -> TransportState;
-    fn get_volume_info(&self) -> VolumeInfo;
-}
 
 /// GENA event subscriber info.
 #[derive(Debug, Clone)]
@@ -637,7 +624,7 @@ async fn read_body(req: Request<Incoming>) -> String {
 fn extract_soap_action(body: &str) -> String {
     if let Some(pos) = body.find("<u:") {
         let rest = &body[pos + 3..];
-        if let Some(end) = rest.find(|c: char| c == ' ' || c == '>' || c == '/') {
+        if let Some(end) = rest.find([' ', '>', '/']) {
             return rest[..end].to_string();
         }
     }

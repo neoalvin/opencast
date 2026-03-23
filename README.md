@@ -17,11 +17,14 @@
 ```
 手机/PC (发送端)                     电视/盒子 (接收端)
 ┌──────────────┐                    ┌────────────────────┐
-│  SSDP/mDNS   │──── 设备发现 ────→│  SSDP 广播          │
+│  SSDP/mDNS   │──── 设备发现 ────→│  SSDP + Bonjour    │
 │  设备发现     │                    │                    │
 │              │                    │  DLNA DMR          │
 │  DLNA DMC    │── SOAP 控制指令 ──→│  (HTTP + SOAP)     │
 │  (控制端)     │                    │        │           │
+│              │                    │  AirPlay Receiver  │
+│  iPhone/iPad │── AirPlay HTTP ──→│  (HTTP + mDNS)     │
+│              │                    │        │           │
 └──────────────┘                    │        ▼           │
                                     │  媒体播放器 (mpv)   │
 内容服务器 ─── HTTP 视频流 ────────→│        ▲           │
@@ -34,11 +37,12 @@
 
 ```
 crates/
-├── opencast-core/       # 核心类型与 trait (Device, MediaInfo, PlaybackControl)
+├── opencast-core/       # 核心类型与 trait (Device, MediaInfo, RendererCallback)
 ├── opencast-discovery/  # 设备发现 (SSDP M-SEARCH / NOTIFY)
 ├── opencast-dlna/       # DLNA/UPnP 协议 (DMC 控制端 + DMR 渲染端)
+├── opencast-airplay/    # AirPlay 媒体接收 (HTTP + mDNS 广播)
 ├── opencast-player/     # 统一播放引擎 (mpv 后端)
-├── opencast-server/     # 电视端接收应用
+├── opencast-server/     # 电视端接收应用 (DLNA + AirPlay)
 └── opencast-cli/        # 命令行投屏工具
 ```
 
@@ -57,11 +61,11 @@ cargo build --release
 ### 电视端 — 启动接收器
 
 ```bash
-# 启动 DLNA 渲染器，其他设备可以发现并投屏到此设备
+# 启动接收器（同时支持 DLNA + AirPlay），其他设备可以发现并投屏到此设备
 cargo run --release --bin opencast-server -- --name "客厅电视"
 
 # 自定义端口
-cargo run --release --bin opencast-server -- --name "客厅电视" --port 9000
+cargo run --release --bin opencast-server -- --name "客厅电视" --port 9000 --airplay-port 7001
 ```
 
 ### 手机/PC端 — 命令行投屏
@@ -107,8 +111,7 @@ cargo run --release --bin opencast-cli -- control stop --device "客厅电视"
 | 协议 | 状态 | 说明 |
 |------|------|------|
 | DLNA/UPnP | ✅ 已实现 | 媒体投屏核心协议，兼容 Android/鸿蒙/智能电视 |
-| AirPlay | 🚧 计划中 | 苹果设备投屏支持 |
-| Google Cast | 🚧 计划中 | Chromecast 协议支持 |
+| AirPlay | ✅ 已实现 | 苹果设备投屏支持 (iPhone/iPad/Mac) |
 | Miracast | 📋 远期 | 屏幕镜像（回退模式） |
 
 ## 支持的媒体格式
@@ -120,11 +123,10 @@ cargo run --release --bin opencast-cli -- control stop --device "客厅电视"
 ## 路线图
 
 - [x] **Phase 1.1** — DLNA 媒体投屏 (DMC + DMR + SSDP)
-- [ ] **Phase 1.2** — AirPlay 接收端
-- [ ] **Phase 1.3** — Google Cast 接收端
-- [ ] **Phase 1.4** — 统一 UI 遥控器
+- [x] **Phase 1.2** — AirPlay 接收端 (HTTP + mDNS)
+- [ ] **Phase 1.3** — Android TV 接收端 APP
+- [ ] **Phase 1.4** — 手机端 APP (iOS + Android + 鸿蒙)
 - [ ] **Phase 2.0** — 屏幕镜像模式 (回退方案)
-- [ ] **Phase 2.1** — Android/iOS/鸿蒙 原生 APP
 - [ ] **Phase 3.0** — 投屏码配对 / 多设备同时投屏
 
 ## 技术栈
@@ -132,8 +134,8 @@ cargo run --release --bin opencast-cli -- control stop --device "客厅电视"
 - **语言:** Rust
 - **异步运行时:** Tokio
 - **HTTP:** Hyper
-- **协议:** SSDP (UDP 多播) + SOAP over HTTP + UPnP/DLNA
-- **播放器:** mpv (通过 IPC 控制)
+- **协议:** SSDP (UDP 多播) + SOAP over HTTP + UPnP/DLNA + AirPlay (HTTP + mDNS)
+- **播放器:** mpv (通过 JSON IPC 控制)
 
 ## 依赖
 

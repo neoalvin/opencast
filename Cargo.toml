@@ -4,6 +4,7 @@ members = [
     "crates/opencast-core",
     "crates/opencast-discovery",
     "crates/opencast-dlna",
+    "crates/opencast-airplay",
     "crates/opencast-player",
     "crates/opencast-server",
     "crates/opencast-cli",
@@ -54,6 +55,7 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 
 # Internal crates
+opencast-airplay = { path = "crates/opencast-airplay" }
 opencast-core = { path = "crates/opencast-core" }
 opencast-discovery = { path = "crates/opencast-discovery" }
 opencast-dlna = { path = "crates/opencast-dlna" }

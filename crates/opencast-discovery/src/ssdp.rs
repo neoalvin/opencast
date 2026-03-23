@@ -16,6 +16,12 @@ pub struct SsdpDiscovery {
     devices: Arc<RwLock<HashMap<String, Device>>>,
 }
 
+impl Default for SsdpDiscovery {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SsdpDiscovery {
     pub fn new() -> Self {
         Self {

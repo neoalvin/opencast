@@ -1,22 +1,27 @@
 use anyhow::Result;
 use clap::Parser;
-use opencast_core::{MediaInfo, PositionInfo, TransportState, VolumeInfo};
-use opencast_dlna::dmr::{DlnaRenderer, RendererCallback};
+use opencast_airplay::AirPlayReceiver;
+use opencast_core::{MediaInfo, PositionInfo, RendererCallback, TransportState, VolumeInfo};
+use opencast_dlna::dmr::DlnaRenderer;
 use opencast_player::{MpvPlayer, Player};
 use std::sync::Arc;
 use tokio::runtime::Handle;
 use tracing::info;
 
 #[derive(Parser)]
-#[command(name = "opencast-server", about = "OpenCast DLNA Media Renderer")]
+#[command(name = "opencast-server", about = "OpenCast Media Renderer (DLNA + AirPlay)")]
 struct Cli {
     /// Device name shown to controllers
     #[arg(short, long, default_value = "OpenCast TV")]
     name: String,
 
-    /// HTTP server port
+    /// DLNA HTTP server port
     #[arg(short, long, default_value_t = 8200)]
     port: u16,
+
+    /// AirPlay HTTP server port
+    #[arg(long, default_value_t = 7000)]
+    airplay_port: u16,
 }
 
 #[tokio::main]
@@ -31,14 +36,16 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     info!("Starting OpenCast Server '{}'", cli.name);
-    info!("Listening on port {}", cli.port);
+    info!("DLNA on port {}, AirPlay on port {}", cli.port, cli.airplay_port);
     info!("Other devices on the same network can now cast media to this device.");
 
     let player = Arc::new(MpvPlayer::new());
-    let callback = Arc::new(MpvCallback::new(player, Handle::current()));
-    let renderer = DlnaRenderer::new(cli.name, cli.port, callback);
+    let callback: Arc<MpvCallback> = Arc::new(MpvCallback::new(player, Handle::current()));
 
-    renderer.start().await?;
+    let renderer = DlnaRenderer::new(cli.name.clone(), cli.port, callback.clone());
+    let airplay = AirPlayReceiver::new(cli.name, cli.airplay_port, callback);
+
+    tokio::try_join!(renderer.start(), airplay.start())?;
 
     Ok(())
 }
