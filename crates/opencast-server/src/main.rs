@@ -1,8 +1,10 @@
 use anyhow::Result;
 use clap::Parser;
-use opencast_core::{PositionInfo, TransportState, VolumeInfo};
+use opencast_core::{MediaInfo, PositionInfo, TransportState, VolumeInfo};
 use opencast_dlna::dmr::{DlnaRenderer, RendererCallback};
-use std::sync::{Arc, Mutex};
+use opencast_player::{MpvPlayer, Player};
+use std::sync::Arc;
+use tokio::runtime::Handle;
 use tracing::info;
 
 #[derive(Parser)]
@@ -32,7 +34,8 @@ async fn main() -> Result<()> {
     info!("Listening on port {}", cli.port);
     info!("Other devices on the same network can now cast media to this device.");
 
-    let callback = Arc::new(SimpleCallback::new());
+    let player = Arc::new(MpvPlayer::new());
+    let callback = Arc::new(MpvCallback::new(player, Handle::current()));
     let renderer = DlnaRenderer::new(cli.name, cli.port, callback);
 
     renderer.start().await?;
@@ -40,95 +43,86 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Simple callback that logs actions and tracks state.
-/// In production, this would integrate with a real media player.
-struct SimpleCallback {
-    state: Mutex<PlayerState>,
+/// Callback that bridges DLNA renderer commands to the mpv player.
+struct MpvCallback {
+    player: Arc<MpvPlayer>,
+    handle: Handle,
 }
 
-struct PlayerState {
-    transport: TransportState,
-    current_url: Option<String>,
-    position: f64,
-    duration: f64,
-    volume: f64,
-    muted: bool,
-}
+impl MpvCallback {
+    fn new(player: Arc<MpvPlayer>, handle: Handle) -> Self {
+        Self { player, handle }
+    }
 
-impl SimpleCallback {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(PlayerState {
-                transport: TransportState::NoMediaPresent,
-                current_url: None,
-                position: 0.0,
-                duration: 0.0,
-                volume: 0.5,
-                muted: false,
-            }),
-        }
+    /// Run an async operation on the player from a sync callback context.
+    fn block_on<F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static>(&self, f: F) {
+        let handle = self.handle.clone();
+        std::thread::spawn(move || {
+            handle.block_on(async {
+                if let Err(e) = f.await {
+                    tracing::error!("Player error: {e}");
+                }
+            });
+        });
     }
 }
 
-impl RendererCallback for SimpleCallback {
+impl RendererCallback for MpvCallback {
     fn on_set_uri(&self, url: String, _metadata: String) {
-        info!(">> Media URL set: {url}");
-        let mut state = self.state.lock().unwrap();
-        state.current_url = Some(url);
-        state.transport = TransportState::Stopped;
-        state.position = 0.0;
+        info!(">> Cast: {url}");
+        let player = self.player.clone();
+        self.block_on(async move {
+            let media = MediaInfo::new(&url);
+            player.load(&media).await
+        });
     }
 
     fn on_play(&self) {
         info!(">> Play");
-        self.state.lock().unwrap().transport = TransportState::Playing;
+        let player = self.player.clone();
+        self.block_on(async move { player.play().await });
     }
 
     fn on_pause(&self) {
         info!(">> Pause");
-        self.state.lock().unwrap().transport = TransportState::Paused;
+        let player = self.player.clone();
+        self.block_on(async move { player.pause().await });
     }
 
     fn on_stop(&self) {
         info!(">> Stop");
-        let mut state = self.state.lock().unwrap();
-        state.transport = TransportState::Stopped;
-        state.position = 0.0;
+        let player = self.player.clone();
+        self.block_on(async move { player.stop().await });
     }
 
     fn on_seek(&self, position_secs: f64) {
         info!(">> Seek to {position_secs:.1}s");
-        self.state.lock().unwrap().position = position_secs;
+        let player = self.player.clone();
+        self.block_on(async move { player.seek(position_secs).await });
     }
 
     fn on_set_volume(&self, volume: u32) {
         info!(">> Volume: {volume}%");
-        self.state.lock().unwrap().volume = volume as f64 / 100.0;
+        let player = self.player.clone();
+        let level = volume as f64 / 100.0;
+        self.block_on(async move { player.set_volume(level).await });
     }
 
     fn on_set_mute(&self, muted: bool) {
         info!(">> Mute: {muted}");
-        self.state.lock().unwrap().muted = muted;
+        let player = self.player.clone();
+        self.block_on(async move { player.set_mute(muted).await });
     }
 
     fn get_position_info(&self) -> PositionInfo {
-        let state = self.state.lock().unwrap();
-        PositionInfo {
-            position: state.position,
-            duration: state.duration,
-            track_uri: state.current_url.clone(),
-        }
+        self.player.position()
     }
 
     fn get_transport_state(&self) -> TransportState {
-        self.state.lock().unwrap().transport
+        self.player.state()
     }
 
     fn get_volume_info(&self) -> VolumeInfo {
-        let state = self.state.lock().unwrap();
-        VolumeInfo {
-            level: state.volume,
-            muted: state.muted,
-        }
+        self.player.volume()
     }
 }

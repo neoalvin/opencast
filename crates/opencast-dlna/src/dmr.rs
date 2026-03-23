@@ -4,14 +4,16 @@ use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode};
+use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use opencast_core::{PositionInfo, TransportState, VolumeInfo};
 use opencast_discovery::ssdp::build_device_description;
 use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 /// Callback for handling media commands from a DLNA controller.
@@ -26,6 +28,16 @@ pub trait RendererCallback: Send + Sync + 'static {
     fn get_position_info(&self) -> PositionInfo;
     fn get_transport_state(&self) -> TransportState;
     fn get_volume_info(&self) -> VolumeInfo;
+}
+
+/// GENA event subscriber info.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct GenaSubscriber {
+    sid: String,
+    callback_url: String,
+    timeout_secs: u64,
+    seq: u32,
 }
 
 /// DLNA Digital Media Renderer (DMR).
@@ -75,6 +87,7 @@ impl DlnaRenderer {
             udn: self.udn.clone(),
             base_url: base_url.clone(),
             callback: self.callback.clone(),
+            subscribers: RwLock::new(HashMap::new()),
         });
 
         // Start SSDP advertisement in background
@@ -83,6 +96,12 @@ impl DlnaRenderer {
             if let Err(e) = advertise_ssdp(&ssdp_state).await {
                 error!("SSDP advertisement error: {e}");
             }
+        });
+
+        // Start GENA event notifier in background
+        let gena_state = state.clone();
+        tokio::spawn(async move {
+            gena_notify_loop(&gena_state).await;
         });
 
         // Accept HTTP connections
@@ -112,6 +131,7 @@ struct RendererState {
     udn: String,
     base_url: String,
     callback: Arc<dyn RendererCallback>,
+    subscribers: RwLock<HashMap<String, GenaSubscriber>>,
 }
 
 async fn handle_request(
@@ -152,13 +172,7 @@ async fn handle_request(
             handle_connection_manager(&body)
         }
         "/AVTransport/event" | "/RenderingControl/event" | "/ConnectionManager/event" => {
-            // GENA event subscription — return 200 for now
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("SID", format!("uuid:{}", uuid::Uuid::new_v4()))
-                .header("TIMEOUT", "Second-300")
-                .body(Full::new(Bytes::new()))
-                .unwrap()
+            handle_gena_subscription(req, &path, &state).await
         }
         _ => Response::builder()
             .status(StatusCode::NOT_FOUND)
@@ -167,6 +181,218 @@ async fn handle_request(
     };
 
     Ok(response)
+}
+
+/// Handle GENA SUBSCRIBE / UNSUBSCRIBE requests.
+async fn handle_gena_subscription(
+    req: Request<Incoming>,
+    path: &str,
+    state: &RendererState,
+) -> Response<Full<Bytes>> {
+    let method = req.method().clone();
+    let headers = req.headers().clone();
+
+    match method.as_str() {
+        "SUBSCRIBE" => {
+            // Check if this is a renewal (has SID header) or new subscription
+            let sid = headers
+                .get("SID")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+
+            if let Some(sid) = sid {
+                // Renewal
+                let mut subs = state.subscribers.write().await;
+                if let Some(sub) = subs.get_mut(&sid) {
+                    sub.timeout_secs = parse_timeout(&headers);
+                    info!("GENA: renewed subscription {sid}");
+                    return gena_subscribe_response(&sid, sub.timeout_secs);
+                }
+                return Response::builder()
+                    .status(StatusCode::PRECONDITION_FAILED)
+                    .body(Full::new(Bytes::from("Unknown SID")))
+                    .unwrap();
+            }
+
+            // New subscription
+            let callback_url = headers
+                .get("CALLBACK")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .trim_matches(|c| c == '<' || c == '>')
+                .to_string();
+
+            if callback_url.is_empty() {
+                return Response::builder()
+                    .status(StatusCode::PRECONDITION_FAILED)
+                    .body(Full::new(Bytes::from("Missing CALLBACK header")))
+                    .unwrap();
+            }
+
+            let timeout = parse_timeout(&headers);
+            let sid = format!("uuid:{}", uuid::Uuid::new_v4());
+            let subscriber = GenaSubscriber {
+                sid: sid.clone(),
+                callback_url: callback_url.clone(),
+                timeout_secs: timeout,
+                seq: 0,
+            };
+
+            state
+                .subscribers
+                .write()
+                .await
+                .insert(sid.clone(), subscriber);
+
+            info!("GENA: new subscription {sid} -> {callback_url} (path: {path})");
+
+            // Send initial event with current state
+            let state_clone = state.callback.clone();
+            let sid_clone = sid.clone();
+            let cb_url = callback_url.clone();
+            tokio::spawn(async move {
+                let transport = state_clone.get_transport_state();
+                let volume = state_clone.get_volume_info();
+                let xml = build_last_change_xml(transport, &volume);
+                send_gena_notify(&cb_url, &sid_clone, 0, &xml).await;
+            });
+
+            gena_subscribe_response(&sid, timeout)
+        }
+        "UNSUBSCRIBE" => {
+            if let Some(sid) = headers.get("SID").and_then(|v| v.to_str().ok()) {
+                state
+                    .subscribers
+                    .write()
+                    .await
+                    .remove(sid);
+                info!("GENA: unsubscribed {sid}");
+            }
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::new()))
+                .unwrap()
+        }
+        _ => Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .body(Full::new(Bytes::new()))
+            .unwrap(),
+    }
+}
+
+fn parse_timeout(headers: &hyper::HeaderMap) -> u64 {
+    headers
+        .get("TIMEOUT")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| {
+            s.strip_prefix("Second-")
+                .and_then(|n| n.parse::<u64>().ok())
+        })
+        .unwrap_or(300)
+}
+
+fn gena_subscribe_response(sid: &str, timeout_secs: u64) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("SID", sid)
+        .header("TIMEOUT", format!("Second-{timeout_secs}"))
+        .header("Content-Length", "0")
+        .body(Full::new(Bytes::new()))
+        .unwrap()
+}
+
+/// Build LastChange event XML for AVTransport.
+fn build_last_change_xml(transport: TransportState, volume: &VolumeInfo) -> String {
+    let vol_pct = (volume.level * 100.0) as u32;
+    let mute = if volume.muted { "1" } else { "0" };
+    format!(
+        r#"<Event xmlns="urn:schemas-upnp-org:metadata-1-0/AVT/">
+  <InstanceID val="0">
+    <TransportState val="{transport}"/>
+    <CurrentTransportActions val="Play,Pause,Stop,Seek"/>
+    <Volume channel="Master" val="{vol_pct}"/>
+    <Mute channel="Master" val="{mute}"/>
+  </InstanceID>
+</Event>"#,
+    )
+}
+
+/// Send GENA NOTIFY to a subscriber.
+async fn send_gena_notify(callback_url: &str, sid: &str, seq: u32, body_xml: &str) {
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">
+  <e:property>
+    <LastChange>{body_xml}</LastChange>
+  </e:property>
+</e:propertyset>"#,
+    );
+
+    let client = reqwest::Client::new();
+    let result = client
+        .request(Method::from_bytes(b"NOTIFY").unwrap(), callback_url)
+        .header("Content-Type", "text/xml; charset=\"utf-8\"")
+        .header("NT", "upnp:event")
+        .header("NTS", "upnp:propchange")
+        .header("SID", sid)
+        .header("SEQ", seq.to_string())
+        .body(xml)
+        .send()
+        .await;
+
+    match result {
+        Ok(resp) => debug!("GENA notify to {callback_url}: {}", resp.status()),
+        Err(e) => debug!("GENA notify failed to {callback_url}: {e}"),
+    }
+}
+
+/// Periodically send state change notifications to all GENA subscribers.
+async fn gena_notify_loop(state: &RendererState) {
+    let mut last_transport = TransportState::NoMediaPresent;
+    let mut last_volume = VolumeInfo {
+        level: 0.5,
+        muted: false,
+    };
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let current_transport = state.callback.get_transport_state();
+        let current_volume = state.callback.get_volume_info();
+
+        // Only notify on state change
+        let changed = current_transport != last_transport
+            || (current_volume.level - last_volume.level).abs() > 0.01
+            || current_volume.muted != last_volume.muted;
+
+        if !changed {
+            continue;
+        }
+
+        last_transport = current_transport;
+        last_volume = current_volume;
+
+        let xml = build_last_change_xml(current_transport, &current_volume);
+
+        let mut subs = state.subscribers.write().await;
+        let to_remove: Vec<String> = Vec::new();
+
+        for (sid, sub) in subs.iter_mut() {
+            sub.seq += 1;
+            let sid = sid.clone();
+            let cb_url = sub.callback_url.clone();
+            let seq = sub.seq;
+            let xml = xml.clone();
+
+            tokio::spawn(async move {
+                send_gena_notify(&cb_url, &sid, seq, &xml).await;
+            });
+        }
+
+        for sid in to_remove {
+            subs.remove(&sid);
+        }
+    }
 }
 
 fn handle_av_transport(body: &str, state: &RendererState) -> Response<Full<Bytes>> {
@@ -179,25 +405,25 @@ fn handle_av_transport(body: &str, state: &RendererState) -> Response<Full<Bytes
             let metadata = extract_tag_value(body, "CurrentURIMetaData").unwrap_or_default();
             info!("SetAVTransportURI: {uri}");
             state.callback.on_set_uri(uri, metadata);
-            soap_response("SetAVTransportURI", "")
+            soap_response("SetAVTransportURI", AV_TRANSPORT_URN, "")
         }
         "Play" => {
             state.callback.on_play();
-            soap_response("Play", "")
+            soap_response("Play", AV_TRANSPORT_URN, "")
         }
         "Pause" => {
             state.callback.on_pause();
-            soap_response("Pause", "")
+            soap_response("Pause", AV_TRANSPORT_URN, "")
         }
         "Stop" => {
             state.callback.on_stop();
-            soap_response("Stop", "")
+            soap_response("Stop", AV_TRANSPORT_URN, "")
         }
         "Seek" => {
             let target = extract_tag_value(body, "Target").unwrap_or_default();
             let secs = xml_templates::parse_duration(&target);
             state.callback.on_seek(secs);
-            soap_response("Seek", "")
+            soap_response("Seek", AV_TRANSPORT_URN, "")
         }
         "GetPositionInfo" => {
             let info = state.callback.get_position_info();
@@ -215,7 +441,7 @@ fn handle_av_transport(body: &str, state: &RendererState) -> Response<Full<Bytes
                 xml_templates::format_duration(info.position),
                 xml_templates::format_duration(info.position),
             );
-            soap_response("GetPositionInfo", &response_body)
+            soap_response("GetPositionInfo", AV_TRANSPORT_URN, &response_body)
         }
         "GetTransportInfo" => {
             let ts = state.callback.get_transport_state();
@@ -225,11 +451,51 @@ fn handle_av_transport(body: &str, state: &RendererState) -> Response<Full<Bytes
                  <CurrentSpeed>1</CurrentSpeed>",
                 ts,
             );
-            soap_response("GetTransportInfo", &response_body)
+            soap_response("GetTransportInfo", AV_TRANSPORT_URN, &response_body)
+        }
+        "GetMediaInfo" => {
+            let info = state.callback.get_position_info();
+            let response_body = format!(
+                "<NrTracks>1</NrTracks>\
+                 <MediaDuration>{}</MediaDuration>\
+                 <CurrentURI>{}</CurrentURI>\
+                 <CurrentURIMetaData></CurrentURIMetaData>\
+                 <NextURI></NextURI>\
+                 <NextURIMetaData></NextURIMetaData>\
+                 <PlayMedium>NETWORK</PlayMedium>\
+                 <RecordMedium>NOT_IMPLEMENTED</RecordMedium>\
+                 <WriteStatus>NOT_IMPLEMENTED</WriteStatus>",
+                xml_templates::format_duration(info.duration),
+                info.track_uri.as_deref().unwrap_or(""),
+            );
+            soap_response("GetMediaInfo", AV_TRANSPORT_URN, &response_body)
+        }
+        "GetTransportSettings" => {
+            soap_response(
+                "GetTransportSettings",
+                AV_TRANSPORT_URN,
+                "<PlayMode>NORMAL</PlayMode><RecQualityMode>NOT_IMPLEMENTED</RecQualityMode>",
+            )
+        }
+        "GetDeviceCapabilities" => {
+            soap_response(
+                "GetDeviceCapabilities",
+                AV_TRANSPORT_URN,
+                "<PlayMedia>NETWORK</PlayMedia>\
+                 <RecMedia>NOT_IMPLEMENTED</RecMedia>\
+                 <RecQualityModes>NOT_IMPLEMENTED</RecQualityModes>",
+            )
+        }
+        "GetCurrentTransportActions" => {
+            soap_response(
+                "GetCurrentTransportActions",
+                AV_TRANSPORT_URN,
+                "<Actions>Play,Pause,Stop,Seek</Actions>",
+            )
         }
         _ => {
             warn!("Unhandled AVTransport action: {action}");
-            soap_response(&action, "")
+            soap_response(&action, AV_TRANSPORT_URN, "")
         }
     }
 }
@@ -244,28 +510,36 @@ fn handle_rendering_control(body: &str, state: &RendererState) -> Response<Full<
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(50);
             state.callback.on_set_volume(vol);
-            soap_response("SetVolume", "")
+            soap_response("SetVolume", RENDERING_CONTROL_URN, "")
         }
         "GetVolume" => {
             let info = state.callback.get_volume_info();
             let vol = (info.level * 100.0) as u32;
-            soap_response("GetVolume", &format!("<CurrentVolume>{vol}</CurrentVolume>"))
+            soap_response(
+                "GetVolume",
+                RENDERING_CONTROL_URN,
+                &format!("<CurrentVolume>{vol}</CurrentVolume>"),
+            )
         }
         "SetMute" => {
             let muted = extract_tag_value(body, "DesiredMute")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
             state.callback.on_set_mute(muted);
-            soap_response("SetMute", "")
+            soap_response("SetMute", RENDERING_CONTROL_URN, "")
         }
         "GetMute" => {
             let info = state.callback.get_volume_info();
             let muted = if info.muted { "1" } else { "0" };
-            soap_response("GetMute", &format!("<CurrentMute>{muted}</CurrentMute>"))
+            soap_response(
+                "GetMute",
+                RENDERING_CONTROL_URN,
+                &format!("<CurrentMute>{muted}</CurrentMute>"),
+            )
         }
         _ => {
             warn!("Unhandled RenderingControl action: {action}");
-            soap_response(&action, "")
+            soap_response(&action, RENDERING_CONTROL_URN, "")
         }
     }
 }
@@ -280,34 +554,63 @@ fn handle_connection_manager(body: &str) -> Response<Full<Bytes>> {
                          http-get:*:video/x-matroska:*,\
                          http-get:*:video/webm:*,\
                          http-get:*:video/avi:*,\
+                         http-get:*:video/x-flv:*,\
+                         http-get:*:video/quicktime:*,\
                          http-get:*:audio/mpeg:*,\
                          http-get:*:audio/mp4:*,\
                          http-get:*:audio/flac:*,\
                          http-get:*:audio/wav:*,\
+                         http-get:*:audio/x-wav:*,\
+                         http-get:*:audio/ogg:*,\
                          http-get:*:image/jpeg:*,\
-                         http-get:*:image/png:*";
+                         http-get:*:image/png:*,\
+                         http-get:*:application/vnd.apple.mpegurl:*,\
+                         http-get:*:application/x-mpegURL:*";
             soap_response(
                 "GetProtocolInfo",
+                CONNECTION_MANAGER_URN,
                 &format!("<Source></Source><Sink>{sink}</Sink>"),
             )
         }
-        _ => soap_response(&action, ""),
+        "GetCurrentConnectionIDs" => {
+            soap_response(
+                "GetCurrentConnectionIDs",
+                CONNECTION_MANAGER_URN,
+                "<ConnectionIDs>0</ConnectionIDs>",
+            )
+        }
+        "GetCurrentConnectionInfo" => {
+            soap_response(
+                "GetCurrentConnectionInfo",
+                CONNECTION_MANAGER_URN,
+                "<RcsID>0</RcsID>\
+                 <AVTransportID>0</AVTransportID>\
+                 <ProtocolInfo></ProtocolInfo>\
+                 <PeerConnectionManager></PeerConnectionManager>\
+                 <PeerConnectionID>-1</PeerConnectionID>\
+                 <Direction>Input</Direction>\
+                 <Status>OK</Status>",
+            )
+        }
+        _ => soap_response(&action, CONNECTION_MANAGER_URN, ""),
     }
 }
 
-fn soap_response(action: &str, body: &str) -> Response<Full<Bytes>> {
+const AV_TRANSPORT_URN: &str = "urn:schemas-upnp-org:service:AVTransport:1";
+const RENDERING_CONTROL_URN: &str = "urn:schemas-upnp-org:service:RenderingControl:1";
+const CONNECTION_MANAGER_URN: &str = "urn:schemas-upnp-org:service:ConnectionManager:1";
+
+fn soap_response(action: &str, service_urn: &str, body: &str) -> Response<Full<Bytes>> {
     let xml = format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
             s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
   <s:Body>
-    <u:{action}Response xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+    <u:{action}Response xmlns:u="{service_urn}">
       {body}
     </u:{action}Response>
   </s:Body>
 </s:Envelope>"#,
-        action = action,
-        body = body,
     );
 
     Response::builder()
@@ -332,7 +635,6 @@ async fn read_body(req: Request<Incoming>) -> String {
 }
 
 fn extract_soap_action(body: &str) -> String {
-    // Look for <u:ActionName ...> pattern
     if let Some(pos) = body.find("<u:") {
         let rest = &body[pos + 3..];
         if let Some(end) = rest.find(|c: char| c == ' ' || c == '>' || c == '/') {
@@ -343,6 +645,7 @@ fn extract_soap_action(body: &str) -> String {
 }
 
 fn extract_tag_value(body: &str, tag: &str) -> Option<String> {
+    // Try plain tag
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     if let Some(start) = body.find(&open) {
@@ -351,19 +654,14 @@ fn extract_tag_value(body: &str, tag: &str) -> Option<String> {
             return Some(body[value_start..value_start + end].to_string());
         }
     }
-    // Also try with namespace prefix
-    let open_ns = format!(":{tag}>");
-    if let Some(start) = body.find(&open_ns) {
-        let value_start = start + open_ns.len();
-        let close_ns = format!(":{tag}>");
-        // Find the closing tag with any namespace prefix
-        if let Some(end) = body[value_start..].find(&format!("</{tag}>")) {
-            return Some(body[value_start..value_start + end].to_string());
-        }
-        if let Some(end_pos) = body[value_start..].find("</") {
-            let remaining = &body[value_start + end_pos..];
-            if remaining.contains(&close_ns) {
-                return Some(body[value_start..value_start + end_pos].to_string());
+    // Try with namespace prefix (e.g. <ns:Tag>)
+    for prefix in ["u:", "m:", ""] {
+        let open_ns = format!("<{prefix}{tag}>");
+        let close_ns = format!("</{prefix}{tag}>");
+        if let Some(start) = body.find(&open_ns) {
+            let value_start = start + open_ns.len();
+            if let Some(end) = body[value_start..].find(&close_ns) {
+                return Some(body[value_start..value_start + end].to_string());
             }
         }
     }
@@ -386,7 +684,7 @@ async fn advertise_ssdp(state: &RendererState) -> anyhow::Result<()> {
     let dest: SocketAddr = SocketAddrV4::new(Ipv4Addr::new(239, 255, 255, 250), 1900).into();
     let description_url = format!("{}/description.xml", state.base_url);
 
-    // Also listen for M-SEARCH requests and respond
+    // Listen for M-SEARCH requests and respond
     let search_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     search_socket.set_reuse_address(true)?;
     #[cfg(unix)]
@@ -402,7 +700,6 @@ async fn advertise_ssdp(state: &RendererState) -> anyhow::Result<()> {
     let description_url_clone = description_url.clone();
     let udn = state.udn.clone();
 
-
     // Spawn M-SEARCH responder
     tokio::spawn(async move {
         let mut buf = [0u8; 4096];
@@ -410,8 +707,10 @@ async fn advertise_ssdp(state: &RendererState) -> anyhow::Result<()> {
             match search_udp.recv_from(&mut buf).await {
                 Ok((len, peer)) => {
                     let msg = String::from_utf8_lossy(&buf[..len]);
-                    if msg.contains("M-SEARCH") &&
-                       (msg.contains("MediaRenderer") || msg.contains("ssdp:all") || msg.contains("upnp:rootdevice"))
+                    if msg.contains("M-SEARCH")
+                        && (msg.contains("MediaRenderer")
+                            || msg.contains("ssdp:all")
+                            || msg.contains("upnp:rootdevice"))
                     {
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\

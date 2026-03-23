@@ -12,3 +12,5 @@ tracing.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 url.workspace = true
+serde.workspace = true
+serde_json.workspace = true
